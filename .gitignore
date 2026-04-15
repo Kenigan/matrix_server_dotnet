@@ -1,0 +1,24 @@
+# Build results
+bin/
+obj/
+*.dll
+*.exe
+*.pdb
+*.suo
+*.user
+.vs/
+.vscode/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+*.sln.iml
+
+# Local environment
+.env
+.env.local
+
+# Application data
+~/Library/Application Support/MatrixServer/
