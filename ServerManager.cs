@@ -1006,37 +1006,41 @@ http {{
     {
         try
         {
-            using (var client = new HttpClient())
+            // Query the database directly
+            var process = new Process
             {
-                var url = "http://localhost:8008/_synapse/admin/v2/users";
-                var response = await client.GetAsync(url);
-
-                if (!response.IsSuccessStatusCode)
+                StartInfo = new ProcessStartInfo
                 {
-                    return (false, new List<string>(), "Server not running or admin API unavailable");
+                    FileName = "/usr/bin/env",
+                    Arguments = "psql -U synapse -d synapse -h localhost -t -c \"SELECT name FROM users ORDER BY name;\"",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
                 }
+            };
 
-                var content = await response.Content.ReadAsStringAsync();
-                var jsonDoc = JsonDocument.Parse(content);
-                var users = new List<string>();
+            process.Start();
+            var output = await process.StandardOutput.ReadToEndAsync();
+            var error = await process.StandardError.ReadToEndAsync();
+            process.WaitForExit();
 
-                if (jsonDoc.RootElement.TryGetProperty("users", out var usersArray))
-                {
-                    foreach (var user in usersArray.EnumerateArray())
-                    {
-                        if (user.TryGetProperty("name", out var nameElement))
-                        {
-                            var name = nameElement.GetString();
-                            if (name != null)
-                            {
-                                users.Add(name);
-                            }
-                        }
-                    }
-                }
-
-                return (true, users.OrderBy(u => u).ToList(), $"Found {users.Count} user(s)");
+            if (process.ExitCode != 0)
+            {
+                return (false, new List<string>(), $"Database query failed: {error.Trim()}");
             }
+
+            var users = new List<string>();
+            foreach (var line in output.Split('\n'))
+            {
+                var trimmed = line.Trim();
+                if (!string.IsNullOrEmpty(trimmed))
+                {
+                    users.Add(trimmed);
+                }
+            }
+
+            return (true, users, $"Found {users.Count} user(s)");
         }
         catch (Exception ex)
         {
