@@ -1,6 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
 
 namespace MatrixServer;
@@ -10,6 +16,8 @@ public class ServerManager
     private readonly string _serverDirectory;
     private readonly string _postgresDataDirectory;
     private readonly string _synapseVenvPython;
+    private readonly string _configFilePath;
+    private string _registrationSharedSecret = "";
     private Process? _synapseProcess;
     private Process? _nginxProcess;
     private DateTime _lastStartTime = DateTime.MinValue;
@@ -17,17 +25,90 @@ public class ServerManager
 
     public bool IsRunning { get; private set; }
 
-    public ServerManager()
+    public ServerManager(string? customDataPath = null)
     {
+        // Determine the base directory for configuration
         var appSupport = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "MatrixServer"
         );
-        _serverDirectory = appSupport;
-        _postgresDataDirectory = Path.Combine(appSupport, "postgres_data");
+        _configFilePath = Path.Combine(appSupport, "config.json");
+
+        // If no custom path provided, load from config or use default
+        string basePath;
+        if (customDataPath != null)
+        {
+            basePath = customDataPath;
+            SaveDataPathConfig(customDataPath);
+        }
+        else
+        {
+            basePath = LoadDataPathConfig() ?? appSupport;
+        }
+
+        _serverDirectory = basePath;
+        _postgresDataDirectory = Path.Combine(basePath, "postgres_data");
         _synapseVenvPython = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".synapse_venv/bin/python3");
 
         SetupServerDirectory();
+    }
+
+    private string? LoadDataPathConfig()
+    {
+        try
+        {
+            if (File.Exists(_configFilePath))
+            {
+                var json = File.ReadAllText(_configFilePath);
+                var config = JsonDocument.Parse(json);
+                if (config.RootElement.TryGetProperty("dataPath", out var pathElement))
+                {
+                    return pathElement.GetString();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Warning: Could not load config: {ex.Message}");
+        }
+        return null;
+    }
+
+    private void SaveDataPathConfig(string dataPath)
+    {
+        try
+        {
+            var configDir = Path.GetDirectoryName(_configFilePath);
+            if (!Directory.Exists(configDir))
+            {
+                Directory.CreateDirectory(configDir!);
+            }
+
+            var config = new { dataPath };
+            var json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(_configFilePath, json);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Warning: Could not save config: {ex.Message}");
+        }
+    }
+
+    public string GetCurrentDataPath()
+    {
+        return _serverDirectory;
+    }
+
+    public void SetDataPath(string newPath)
+    {
+        if (IsRunning)
+        {
+            throw new InvalidOperationException("Cannot change data path while server is running");
+        }
+
+        SaveDataPathConfig(newPath);
+        Console.WriteLine($"Data path will be changed to: {newPath}");
+        Console.WriteLine("Note: Restart the application for the change to take effect.");
     }
 
     private void SetupServerDirectory()
@@ -102,9 +183,36 @@ public class ServerManager
     private void WriteHomeserverConfig()
     {
         var configPath = Path.Combine(_serverDirectory, "synapse/config");
+        var configFilePath = Path.Combine(configPath, "homeserver.yaml");
         var dataPath = Path.Combine(_serverDirectory, "synapse");
         var logsPath = Path.Combine(_serverDirectory, "synapse/logs");
         var mediaPath = Path.Combine(_serverDirectory, "media");
+
+        // Try to read existing registration_shared_secret from config
+        if (File.Exists(configFilePath))
+        {
+            try
+            {
+                var existingConfig = File.ReadAllText(configFilePath);
+                var match = System.Text.RegularExpressions.Regex.Match(existingConfig, @"registration_shared_secret:\s*[""']?([^""'\n]+)[""']?");
+                if (match.Success)
+                {
+                    _registrationSharedSecret = match.Groups[1].Value.Trim().Trim('"').Trim('\'');
+                }
+            }
+            catch { }
+        }
+
+        // Generate registration_shared_secret only if we didn't find an existing one
+        if (string.IsNullOrEmpty(_registrationSharedSecret))
+        {
+            using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
+            {
+                var secretBytes = new byte[32];
+                rng.GetBytes(secretBytes);
+                _registrationSharedSecret = Convert.ToBase64String(secretBytes);
+            }
+        }
 
         var config = $@"server_name: ""localhost""
 pid_file: {dataPath}/homeserver.pid
@@ -148,6 +256,7 @@ registrations_require_3pid: []
 
 macaroon_secret_key: ""GENERATED_SECRET_KEY_REPLACE_THIS""
 form_secret: ""GENERATED_FORM_SECRET_REPLACE_THIS""
+registration_shared_secret: ""{_registrationSharedSecret}""
 
 signing_key_path: ""{configPath}/localhost.signing.key""
 
@@ -450,7 +559,7 @@ http {{
                 StartInfo = new ProcessStartInfo
                 {
                     FileName = "/bin/bash",
-                    Arguments = $"-c \"/opt/homebrew/Cellar/postgresql@15/15.17/bin/pg_ctl stop -D '{_postgresDataDirectory}' -m fast\"",
+                    Arguments = $"-c \"/opt/homebrew/Cellar/postgresql@15/15.17/bin/pg_ctl stop -D '{_postgresDataDirectory}' -m fast 2>/dev/null || true\"",
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
@@ -460,14 +569,13 @@ http {{
 
             process.Start();
             process.WaitForExit(5000);
-            Console.WriteLine("✓ PostgreSQL stopped");
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Error stopping PostgreSQL: {ex.Message}");
         }
 
-        // Also try to kill any remaining postgres processes
+        // Force kill any remaining postgres processes
         try
         {
             var process = new Process
@@ -475,7 +583,7 @@ http {{
                 StartInfo = new ProcessStartInfo
                 {
                     FileName = "/bin/bash",
-                    Arguments = "-c \"pkill -f 'postgres -D' || true\"",
+                    Arguments = "-c \"pkill -9 -f 'postgres -D' || pkill -9 -f 'postgres' || true\"",
                     UseShellExecute = false,
                     CreateNoWindow = true
                 }
@@ -484,6 +592,8 @@ http {{
             process.WaitForExit(2000);
         }
         catch { }
+
+        Console.WriteLine("✓ PostgreSQL stopped");
     }
 
     private async Task<bool> StartSynapseAsync()
@@ -554,6 +664,12 @@ http {{
         if (_synapseProcess?.HasExited == false)
         {
             _synapseProcess.Kill();
+            // Wait for process to fully terminate (up to 5 seconds)
+            if (!_synapseProcess.WaitForExit(5000))
+            {
+                // Force kill if it doesn't exit gracefully
+                _synapseProcess.Kill(true);
+            }
             _synapseProcess.Dispose();
             _synapseProcess = null;
             Console.WriteLine("✓ Synapse stopped");
@@ -603,7 +719,7 @@ http {{
                 StartInfo = new ProcessStartInfo
                 {
                     FileName = "/bin/bash",
-                    Arguments = "-c \"/opt/homebrew/Cellar/nginx/1.29.8/bin/nginx -s quit\"",
+                    Arguments = "-c \"/opt/homebrew/Cellar/nginx/1.29.8/bin/nginx -s quit 2>/dev/null || true\"",
                     UseShellExecute = false,
                     CreateNoWindow = true
                 }
@@ -611,17 +727,42 @@ http {{
 
             process.Start();
             process.WaitForExit();
-            Console.WriteLine("✓ Nginx stopped");
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Error stopping Nginx: {ex.Message}");
         }
 
+        // Ensure the stored process is fully terminated
         if (_nginxProcess?.HasExited == false)
         {
             _nginxProcess.Kill();
+            if (!_nginxProcess.WaitForExit(3000))
+            {
+                _nginxProcess.Kill(true);
+            }
         }
+        _nginxProcess = null;
+
+        // Force kill any remaining nginx processes
+        try
+        {
+            var process = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = "/bin/bash",
+                    Arguments = "-c \"pkill -f nginx || true\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }
+            };
+            process.Start();
+            process.WaitForExit(2000);
+        }
+        catch { }
+
+        Console.WriteLine("✓ Nginx stopped");
     }
 
     public async Task StopServerAsync()
@@ -630,6 +771,28 @@ http {{
         await StopSynapseAsync();
         await StopNginxAsync();
         await StopPostgresAsync();
+        
+        // Give processes a moment to fully terminate
+        await Task.Delay(2000);
+        
+        // Force kill any remaining synapse python processes
+        try
+        {
+            var process = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = "/bin/bash",
+                    Arguments = "-c \"pkill -9 -f 'synapse.app.homeserver' || pkill -9 -f 'synapse' || true\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }
+            };
+            process.Start();
+            process.WaitForExit(2000);
+        }
+        catch { }
+        
         IsRunning = false;
         Console.WriteLine("✓ All services stopped");
     }
@@ -683,11 +846,20 @@ http {{
 
     private bool AreCoreProcessesRunning()
     {
-        // Check if Synapse process is still running
-        if (_synapseProcess != null && !_synapseProcess.HasExited)
+        // Check if Synapse process is still running (but skip if it's null/disposed)
+        if (_synapseProcess != null)
         {
-            // Synapse is still running
-            return true;
+            try
+            {
+                if (!_synapseProcess.HasExited)
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+                // Process has been disposed, it's definitely not running
+            }
         }
 
         // If we don't have a process reference, check system processes
@@ -753,5 +925,203 @@ http {{
         {
             return $"Error reading logs: {ex.Message}";
         }
+    }
+
+    public async Task<(bool success, string message)> CreateUserAsync(string username, string password)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+            {
+                return (false, "Username and password cannot be empty");
+            }
+
+            using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+
+            // Fetch nonce from the admin register endpoint
+            var nonceResponse = await httpClient.GetAsync("http://localhost:8008/_synapse/admin/v1/register");
+            var nonceBody = await nonceResponse.Content.ReadAsStringAsync();
+
+            string nonce = "";
+            try
+            {
+                var doc = JsonDocument.Parse(nonceBody);
+                if (doc.RootElement.TryGetProperty("nonce", out var nonceElement))
+                    nonce = nonceElement.GetString() ?? "";
+            }
+            catch { }
+
+            if (string.IsNullOrEmpty(nonce))
+                return (false, "Failed to get registration nonce from server");
+
+            // Calculate HMAC-SHA1: key = UTF-8 bytes of the secret string (not base64-decoded)
+            // Synapse admin flag format is "admin" or "notadmin"
+            string userLocalpart = username.ToLower();
+            string hmacPayload = $"{nonce}\0{userLocalpart}\0{password}\0notadmin";
+
+            byte[] secretBytes = Encoding.UTF8.GetBytes(_registrationSharedSecret);
+            string hmac;
+            using (var hmacSha1 = new HMACSHA1(secretBytes))
+            {
+                var hash = hmacSha1.ComputeHash(Encoding.UTF8.GetBytes(hmacPayload));
+                hmac = Convert.ToHexString(hash).ToLower();
+            }
+            // POST registration payload directly via HttpClient (no shell escaping issues)
+            var payload = new { nonce, username = userLocalpart, password, admin = false, mac = hmac };
+            var json = JsonSerializer.Serialize(payload);
+
+            // Debug: print the payload and HMAC so we can compare with Synapse's expected values
+            Console.WriteLine($"DEBUG: Registration payload: {json}");
+            Console.WriteLine($"DEBUG: Computed HMAC: {hmac}");
+
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+            var regResponse = await httpClient.PostAsync("http://localhost:8008/_synapse/admin/v1/register", content);
+            var output = await regResponse.Content.ReadAsStringAsync();
+
+            if (output.Contains("\"user_id\""))
+                return (true, $"User '@{userLocalpart}:localhost' created successfully");
+
+            try
+            {
+                var doc = JsonDocument.Parse(output);
+                if (doc.RootElement.TryGetProperty("errcode", out var errcode))
+                {
+                    if (errcode.GetString() == "M_USER_IN_USE")
+                        return (false, $"User '{username}' already exists");
+                    if (doc.RootElement.TryGetProperty("error", out var errorMsg))
+                        return (false, $"User creation failed: {errorMsg.GetString()}");
+                }
+            }
+            catch { }
+
+            return (false, $"User creation failed. Response: {output}");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"Error creating user: {ex.Message}");
+        }
+    }
+
+    public async Task<(bool success, List<string> users, string message)> ListUsersAsync()
+    {
+        try
+        {
+            using (var client = new HttpClient())
+            {
+                var url = "http://localhost:8008/_synapse/admin/v2/users";
+                var response = await client.GetAsync(url);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    return (false, new List<string>(), "Server not running or admin API unavailable");
+                }
+
+                var content = await response.Content.ReadAsStringAsync();
+                var jsonDoc = JsonDocument.Parse(content);
+                var users = new List<string>();
+
+                if (jsonDoc.RootElement.TryGetProperty("users", out var usersArray))
+                {
+                    foreach (var user in usersArray.EnumerateArray())
+                    {
+                        if (user.TryGetProperty("name", out var nameElement))
+                        {
+                            var name = nameElement.GetString();
+                            if (name != null)
+                            {
+                                users.Add(name);
+                            }
+                        }
+                    }
+                }
+
+                return (true, users.OrderBy(u => u).ToList(), $"Found {users.Count} user(s)");
+            }
+        }
+        catch (Exception ex)
+        {
+            return (false, new List<string>(), $"Error listing users: {ex.Message}");
+        }
+    }
+
+    public async Task<(long bytes, string formatted)> GetServerDiskUsageAsync()
+    {
+        try
+        {
+            // Calculate directory size using du command for better accuracy
+            var process = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = "/bin/bash",
+                    Arguments = $"-c \"du -sb '{_serverDirectory}' 2>/dev/null | awk '{{print $1}}'\"",
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }
+            };
+
+            process.Start();
+            var output = await process.StandardOutput.ReadToEndAsync();
+            process.WaitForExit();
+
+            if (long.TryParse(output.Trim(), out var bytes))
+            {
+                return (bytes, FormatBytes(bytes));
+            }
+
+            // Fallback: calculate recursively if du fails
+            return await CalculateDirectorySizeAsync(_serverDirectory);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error calculating disk usage: {ex.Message}");
+            return (0, "Error calculating size");
+        }
+    }
+
+    private async Task<(long bytes, string formatted)> CalculateDirectorySizeAsync(string path)
+    {
+        long totalSize = 0;
+
+        try
+        {
+            var directoryInfo = new DirectoryInfo(path);
+
+            // Get all files in this directory and subdirectories
+            var files = directoryInfo.GetFiles("*", System.IO.SearchOption.AllDirectories);
+            foreach (var file in files)
+            {
+                try
+                {
+                    totalSize += file.Length;
+                }
+                catch
+                {
+                    // Skip files we can't read
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Warning: Could not access some files: {ex.Message}");
+        }
+
+        return (totalSize, FormatBytes(totalSize));
+    }
+
+    private string FormatBytes(long bytes)
+    {
+        string[] sizes = { "B", "KB", "MB", "GB", "TB" };
+        double len = bytes;
+        int order = 0;
+
+        while (len >= 1024 && order < sizes.Length - 1)
+        {
+            order++;
+            len = len / 1024;
+        }
+
+        return $"{len:0.##} {sizes[order]}";
     }
 }
