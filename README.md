@@ -21,31 +21,61 @@ A cross-platform console application for managing a Matrix homeserver (Synapse) 
 
 ## Installation
 
+### Automated Setup (Recommended)
+
+Run the automated startup script to install all dependencies:
+
+```bash
+./startup.sh
+```
+
+This script will:
+- Verify/install Homebrew
+- Install Python 3.11
+- Install PostgreSQL 15
+- Create Python virtual environment for Synapse
+- Install matrix-synapse and dependencies (lxml, psycopg2)
+- Build the .NET project
+- Generate Synapse configuration
+
+### Manual Setup
+
 1. Install dependencies:
 ```bash
-brew install postgresql@15 nginx
-pip install matrix-synapse[postgres]
+brew install postgresql@15 nginx python@3.11
 ```
 
-2. Run setup script (from original Xcode project):
+2. Create Python virtual environment:
 ```bash
-bash Scripts/setup.sh
+/opt/homebrew/bin/python3.11 -m venv ~/.synapse_venv
+source ~/.synapse_venv/bin/activate
 ```
 
-3. Build the .NET application:
+3. Install Synapse and dependencies:
+```bash
+pip install --upgrade pip
+pip install matrix-synapse lxml psycopg2-binary
+```
+
+4. Generate Synapse configuration:
+```bash
+synapse_homeserver --generate-config -H matrix.example.com -c ~/.synapse/homeserver.yaml --report-stats=no
+```
+
+5. Build the .NET application:
 ```bash
 dotnet build
 ```
 
-## Usage
+## Quick Start
 
-Run the application:
+After installation, start the Matrix server:
+
 ```bash
 dotnet run
 ```
 
-### Commands
-
+Then select from the menu:
 - **start** - Start all services (PostgreSQL, Synapse, Nginx)
 - **stop** - Stop all services
 - **status** - Check current server status

@@ -152,7 +152,7 @@ public class ServerManager
                     StartInfo = new ProcessStartInfo
                     {
                         FileName = "/bin/bash",
-                        Arguments = $"-c \"/opt/homebrew/Cellar/postgresql@15/15.17/bin/initdb -D '{_postgresDataDirectory}' --encoding=UTF8 --locale=C\"",
+                        Arguments = $"-c \"/opt/homebrew/Cellar/postgresql@15/15.17/bin/initdb -D '{_postgresDataDirectory}' --encoding=UTF8 --locale=C -U postgres\"",
                         RedirectStandardOutput = true,
                         RedirectStandardError = true,
                         UseShellExecute = false,
@@ -414,6 +414,15 @@ http {{
 
         await Task.Delay(2000);
 
+        if (!await InitializePostgresDatabaseAsync())
+        {
+            Console.WriteLine("Failed to initialize PostgreSQL database");
+            await StopPostgresAsync();
+            return false;
+        }
+
+        await Task.Delay(1000);
+
         if (!await StartSynapseAsync())
         {
             Console.WriteLine("Failed to start Synapse");
@@ -594,6 +603,58 @@ http {{
         catch { }
 
         Console.WriteLine("✓ PostgreSQL stopped");
+    }
+
+    private async Task<bool> InitializePostgresDatabaseAsync()
+    {
+        Console.WriteLine("Initializing PostgreSQL database and user...");
+
+        try
+        {
+            // Create synapse user if it doesn't exist
+            var createUserScript = @"
+CREATE USER synapse WITH ENCRYPTED PASSWORD 'synapse_password';
+CREATE DATABASE synapse WITH OWNER synapse;
+GRANT ALL PRIVILEGES ON DATABASE synapse TO synapse;
+";
+
+            var tempScriptPath = Path.Combine(Path.GetTempPath(), "init_synapse_db.sql");
+            File.WriteAllText(tempScriptPath, createUserScript);
+
+            var process = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = "/bin/bash",
+                    Arguments = $"-c \"/opt/homebrew/Cellar/postgresql@15/15.17/bin/psql -h localhost -U postgres -f '{tempScriptPath}'\"",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }
+            };
+
+            process.Start();
+            var output = await process.StandardOutput.ReadToEndAsync();
+            var error = await process.StandardError.ReadToEndAsync();
+            process.WaitForExit();
+
+            // Clean up temp file
+            try { File.Delete(tempScriptPath); } catch { }
+
+            if (error.Length > 0 && !error.Contains("already exists"))
+            {
+                Console.WriteLine($"⚠ Database init warning: {error}");
+            }
+
+            Console.WriteLine("✓ PostgreSQL database initialized");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"PostgreSQL database initialization error: {ex.Message}");
+            return false;
+        }
     }
 
     private async Task<bool> StartSynapseAsync()
